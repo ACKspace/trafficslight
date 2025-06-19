@@ -1,8 +1,6 @@
-#define ESP
-//#define DEBUG
+#define DEBUG
 
 // ESP-NOW dynamic traffic light simulator
-#ifdef ESP
 #include <ESP8266WiFi.h>
 #include <espnow.h>
 #include <Adafruit_NeoPixel.h>
@@ -16,10 +14,9 @@ uint8_t broadcastMAC[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
 // Declare our NeoPixel strip object:
 Adafruit_NeoPixel strip(3, LED_PIN, NEO_RGB + NEO_KHZ800);
-#endif
 
 volatile uint8_t currentIndex = 255;
-volatile uint8_t length = 0;
+volatile uint8_t length = 1;
 
 // TODO: cleanup and put in array
 const int BLINK_TIME = 650;
@@ -32,7 +29,6 @@ const int RED_TIME_SLOW = 15000;
 const int RED_TIME = 5000;
 const int RED_TIME_FAST = 2000;
 
-const int RELEASE_INTERSECTION_TIME = 500; // Initial time before continuity is checked and adjusted for
 const int CHECK_CONTINUITY_TIME = 500;     // Recurring time before continuity is checked and adjusted for
 const int WAIT_TIMEOUT_TIME = 30000;       // Make sure it's above the highest pause we have
 
@@ -44,7 +40,7 @@ typedef enum {
   GREEN,
   PREPARE_GREEN,
   RELEASE_INTERSECTION,
-  CHECK_CONTINUITY,
+  STANDBY,
   LENGTH,
   WAIT_TIMEOUT,
   REMOVE_INDEX,
@@ -92,8 +88,8 @@ void printState(State _state, uint8_t _index)
       Serial.print("RELEASE_INTERSECTION");
       break;
 
-    case CHECK_CONTINUITY:
-      Serial.print("CHECK_CONTINUITY");
+    case STANDBY:
+      Serial.print("STANDBY");
       break;
 
     case LENGTH:
@@ -113,7 +109,6 @@ void printState(State _state, uint8_t _index)
 #endif
 }
 
-#ifdef ESP
 void onMessage(unsigned char* mac, unsigned char* data, unsigned char len)
 {
   // cast & copy data
@@ -127,26 +122,6 @@ void onMessage(unsigned char* mac, unsigned char* data, unsigned char len)
 
   recv(incomingMessage.state, incomingMessage.index);
 }
-#else
-void simButtons()
-{
-  if (!digitalRead(4))
-  {
-    recv(BLINK_OFF, 255);
-    delay(1000);
-  }
-  if (!digitalRead(3))
-  {
-    recv(PREPARE_GREEN, 1);
-    delay(1000);
-  }
-  if (!digitalRead(2))
-  {
-    recv(RELEASE_INTERSECTION, 1);
-    delay(1000);
-  }
-}
-#endif
 
 void send(State _state, uint8_t _index)
 {
@@ -156,13 +131,11 @@ void send(State _state, uint8_t _index)
   Serial.print('\n');
 #endif
 
-#ifdef ESP
   // Send the data
   Message remote;
   remote.index = _index;
   remote.state = _state;
   esp_now_send(broadcastMAC, (uint8_t *) &remote, sizeof(remote));
-#endif
 }
 
 void recv(State _state, uint8_t _index)
@@ -173,15 +146,17 @@ void recv(State _state, uint8_t _index)
   Serial.print('\n');
 #endif
 
-  // Something is alive, postpone the wait timeout
+  // Another node is running, postpone the wait timeout
   if (nextState == WAIT_TIMEOUT && _state != REMOVE_INDEX)
-    nextTick = millis() + WAIT_TIMEOUT_TIME;
+     nextTick = millis() + WAIT_TIMEOUT_TIME;
 
-  uint8_t previous = (currentIndex + length - 1) % length;
+  bool isPredecessor = length && _index < 255 && ((_index + 1) % length) == currentIndex;
+  bool isSuccessor = length && _index < 255 && ((currentIndex + 1) % length) == _index;
 
   switch (_state)
   {
     case BLINK_OFF:
+      // Is there a new node and are we master?
       if (_index == 255 && currentIndex == 0)
       {
         length++;
@@ -190,52 +165,70 @@ void recv(State _state, uint8_t _index)
       }
       break;
 
+    case BLINK_ON:
+      // Assume master is sending this: synchronize
+      nextState = BLINK_ON;
+      nextTick = 0; // immediate
+      break;
+
     case LENGTH:
       length = _index;
       if (currentIndex == 255)
       {
         currentIndex = length - 1;
         nextState = WAIT_TIMEOUT;
-        nextTick = millis() + WAIT_TIMEOUT_TIME; // failsafe mode
+        nextTick = millis() + WAIT_TIMEOUT_TIME + random(2000);
         color(RED);
       }
       break;
 
     case RELEASE_INTERSECTION:
-      // Do we need to take over?
-#ifdef DEBUG
-      Serial.print("us: ");
-      Serial.print(currentIndex);
-      Serial.print(", prev: ");
-      Serial.print(previous);
-      Serial.print(", length: ");
-      Serial.println(length);
-#endif
-      if (currentIndex == previous)
+      // Our turn now!
+      if (isPredecessor)
       {
         nextState = PREPARE_GREEN;
-        nextTick = 0; // immediate        
+        nextTick = 0; // immediate
       }
-        
       break;
 
-    case PREPARE_GREEN:
-      // Other node is taking over
-      nextState = WAIT_TIMEOUT;
-      nextTick = millis() + WAIT_TIMEOUT_TIME; // failsafe mode
+    case RED:
+      // Assume we're on hold
+      if (isPredecessor)
+      {
+        nextState = STANDBY;
+        nextTick = 0; // immediate
+      }
+      break;
+
+    case STANDBY:
+      // TODO: We could assume successor
+      if (isSuccessor)
+      {
+        nextState = RELEASE_INTERSECTION;
+        // Note that the nextTick was ticking to REMOVE; we now continue broadcast as normal
+      }
       break;
 
     case REMOVE_INDEX:
-      // If the index is lower than ours, we need to shift and check if its our turn
-      // Note that we could cause conflict if we're 1 and receive 0
-      if (currentIndex > _index + 1)
-        currentIndex--;
+      // Removing index affects the length (we do a failsafe: if received this, there are at least 2 of us)
+      if (length > 2)
+        length--;
 
-      // Is is our turn?
-      if (currentIndex == _index + 1)
+      // If we're before the incoming index, we don't have to close the gap.
+      if (currentIndex <= _index)
+        return;
+
+      currentIndex--;
+      if (currentIndex == _index)
       {
-        nextState = PREPARE_GREEN;
-        nextTick = 0; // immediate        
+        // Conflict! Do a complete restart
+        ESP.restart();
+      }
+      else if (currentIndex == _index + 1)
+      {
+        // Our turn!
+        nextState = STANDBY;
+        nextTick = 0; // immediate
       }
       break;
   }
@@ -243,7 +236,6 @@ void recv(State _state, uint8_t _index)
   // TODO: detect conflict and randomize message to send index++
 }
 
-#ifdef ESP
 void color(State _state)
 {
 #ifdef DEBUG
@@ -290,40 +282,13 @@ void color(State _state)
   }
   strip.show();  
 }
-#else
-void color(State _state)
-{
-  digitalWrite(5, LOW);
-  digitalWrite(6, LOW);
-  digitalWrite(7, LOW);
-
-  switch (_state)
-  {
-    case BLINK_ON:
-    case AMBER:
-      digitalWrite(6, HIGH);
-      break;
-    case RED:
-      digitalWrite(5, HIGH);
-      break;
-    case PREPARE_GREEN:
-      digitalWrite(5, HIGH);
-      digitalWrite(6, HIGH);
-      break;
-    case GREEN:
-      digitalWrite(7, HIGH);
-      break;
-  }
-}
-#endif
 
 void setup()
 {
   Serial.begin(115200);
-#ifdef ESP
-  strip.begin();           // INITIALIZE NeoPixel strip object (REQUIRED)
-  strip.show();            // Turn OFF all pixels ASAP
-  strip.setBrightness(255); // Set BRIGHTNESS to about 1/5 (max = 255)
+  strip.begin();
+  strip.show();
+  strip.setBrightness(255);
 
   // init mode
   WiFi.mode(WIFI_STA);
@@ -347,20 +312,9 @@ void setup()
   pinMode(GERMAN_PIN, INPUT_PULLUP);
   pinMode(SLOW_PIN, INPUT_PULLUP);
   pinMode(FAST_PIN, INPUT_PULLUP);
-  
-#else
-  pinMode(2, INPUT_PULLUP);
-  pinMode(3, INPUT_PULLUP);
-  pinMode(4, INPUT_PULLUP);
-
-  pinMode(5, OUTPUT);
-  pinMode(6, OUTPUT);
-  pinMode(7, OUTPUT);
-#endif
 
   currentIndex = 255;
   color(BLINK_ON);
-  send(BLINK_ON, currentIndex);
   delay(BLINK_TIME);
   color(BLINK_OFF);
   send(BLINK_OFF, currentIndex);
@@ -371,22 +325,22 @@ void setup()
     Serial.println("single master");
 #endif
     currentIndex = 0; // "master"
-    length = 1;
   }
 }
 
 void loop() {
-#ifndef ESP
-  simButtons();
-#endif
-
   if (millis() < nextTick)
     return;
 
-  if (length == 1)
+  // If we're the only one or set to blink mode by "shorting" both speed pins
+  if (length == 1 || (nextState != LENGTH && !digitalRead(FAST_PIN) && !digitalRead(SLOW_PIN)))
   {
     // Single light goes in blink mode
     color(nextState);
+    // // If we're "master", emit the blinking so others can synchronize
+    if (!currentIndex)
+      send(nextState, currentIndex);
+
     if (nextState == BLINK_OFF)
       nextState = BLINK_ON;
     else
@@ -401,84 +355,85 @@ void loop() {
       // New length restarts the program loop
       nextState = PREPARE_GREEN;
       send(LENGTH, length); // Special case "index"
+      // Next tick is immediate
       break;
 
-    case BLINK_ON:
-      color(BLINK_ON);
-      // Go to off autonomously
-      nextTick = millis() + BLINK_TIME;
-      nextState = BLINK_OFF;
-      break;
+   case BLINK_ON:
+     color(BLINK_ON);
+     // Go to off autonomously
+     nextTick = millis() + BLINK_TIME;
+     nextState = BLINK_OFF;
+     break;
 
-    case BLINK_OFF:
-      color(BLINK_OFF);
-      // Do nothing: wait
-      delay(250);
-      break;
+   case BLINK_OFF:
+     color(BLINK_OFF);
+     // Do nothing: wait
+     nextTick = millis() + BLINK_TIME + random(2000);     
+     nextState = WAIT_TIMEOUT;
+     break;
 
     case PREPARE_GREEN:
       nextState = GREEN;
       color(PREPARE_GREEN);
       nextTick = millis() + PREPARE_GREEN_TIME;
-      send(PREPARE_GREEN, currentIndex); // This triggers continuity
       break;
 
     case GREEN:
       nextState = AMBER;
       color(GREEN);
       nextTick = millis() + GREEN_TIME;
-      //send(GREEN, currentIndex);
       break;
 
     case AMBER:
       nextState = RED;
       color(AMBER);
       nextTick = millis() + AMBER_TIME;
-      //send(AMBER, currentIndex);
       break;
 
     case RED:
-      nextState = RELEASE_INTERSECTION;
+      // Note that sending red implies a STANDBY response; if not: REMOVE the index
+      nextState = REMOVE_INDEX;
       color(RED);
       if (!digitalRead(FAST_PIN))
-      {
-        // Hack: ultra fast
-        if (!digitalRead(SLOW_PIN))
-          nextTick = 0;
-        else
           nextTick = millis() + RED_TIME_FAST;
-      }
-        
       else if (!digitalRead(SLOW_PIN))
         nextTick = millis() + RED_TIME_SLOW;
       else
         nextTick = millis() + RED_TIME;
-      //send(RED, currentIndex);
+
+      send(RED, currentIndex);
       break;
 
     case RELEASE_INTERSECTION:
-      // State should be overridden by next node
-      nextState = CHECK_CONTINUITY;
-      nextTick = millis() + RELEASE_INTERSECTION_TIME;
+      // We got here because the next node responded with STANDBY
+      nextState = WAIT_TIMEOUT;
+      nextTick = millis() + WAIT_TIMEOUT_TIME + random(2000);
       send(RELEASE_INTERSECTION, currentIndex);
       break;
 
-    case CHECK_CONTINUITY:
+    case REMOVE_INDEX:
       // If we arrive here, the next node does not exist
       nextTick = millis() + CHECK_CONTINUITY_TIME;
-      length--;
-      // Make sure we stay within the list
-      if (currentIndex >= length)
-        currentIndex--;
-      send(REMOVE_INDEX, currentIndex);
+      if (length > 1)
+      {      
+        length--;
+        // Make sure we stay within the list
+        if (currentIndex >= length)
+          currentIndex--;
+        send(REMOVE_INDEX, currentIndex);
+      }
       break;
 
+    case STANDBY:
+      nextState = WAIT_TIMEOUT;
+      nextTick = millis() + WAIT_TIMEOUT_TIME + random(2000);
+      send(STANDBY, currentIndex);
+      break;
+
+
     case WAIT_TIMEOUT:
-      // Panic: just blink
-      nextState = BLINK_OFF;
-      nextTick = 0;
-      // TODO: if the green node is turned off,
-      //       the program halts: build in a failsafe that updates the timeout every time a message arrives
+      // Program loop failed/halted
+      // comes from STANDBY (we're successor), LENGTH (we're new), BLINK_OFF (we're slave), RELEASE_INTERSECTION (we're predecessor)
       break;
   }
 }
