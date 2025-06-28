@@ -22,12 +22,14 @@ volatile uint8_t length = 1;
 const int BLINK_TIME = 650;
 const int GREEN_TIME = 4000;
 const int AMBER_TIME = 2500;
+
+volatile uint8_t retries = 4;
 const int PREPARE_GREEN_TIME = 1500;
 
 // NOTE: take PREPARE_GREEN_TIME into account
-const int RED_TIME_SLOW = 15000;
-const int RED_TIME = 5000;
-const int RED_TIME_FAST = 2000;
+const int RED_TIME_SLOW = 3750; // 15000;
+const int RED_TIME = 1250; // 5000;
+const int RED_TIME_FAST = 500; // 2000;
 
 const int CHECK_CONTINUITY_TIME = 500;     // Recurring time before continuity is checked and adjusted for
 const int WAIT_TIMEOUT_TIME = 30000;       // Make sure it's above the highest pause we have
@@ -182,11 +184,20 @@ void recv(State _state, uint8_t _index)
       }
       break;
 
+    case PREPARE_GREEN:
+      // We got confirmation: we're done for now.
+      nextState = WAIT_TIMEOUT;
+      nextTick = millis() + WAIT_TIMEOUT_TIME + random(2000);
+      break;
+
     case RELEASE_INTERSECTION:
       // Our turn now!
       if (isPredecessor)
       {
         nextState = PREPARE_GREEN;
+        // TODO: proper time
+        // For now, the predecessor sends release every 500ms
+        // until it receives our PREPARE_GREEN message.
         nextTick = 0; // immediate
       }
       break;
@@ -205,6 +216,11 @@ void recv(State _state, uint8_t _index)
       if (isSuccessor)
       {
         nextState = RELEASE_INTERSECTION;
+        // TODO: determine proper red time
+        nextTick = millis() + retries * RED_TIME;
+        // Prepare the next sync
+        retries = 4;
+
         // Note that the nextTick was ticking to REMOVE; we now continue broadcast as normal
       }
       break;
@@ -375,6 +391,8 @@ void loop() {
     case PREPARE_GREEN:
       nextState = GREEN;
       color(PREPARE_GREEN);
+      // We transmit PREPARE_GREEN so our predecessor knows we're taking over
+      send(PREPARE_GREEN, currentIndex);
       nextTick = millis() + PREPARE_GREEN_TIME;
       break;
 
@@ -386,13 +404,18 @@ void loop() {
 
     case AMBER:
       nextState = RED;
+      retries = 4;
       color(AMBER);
       nextTick = millis() + AMBER_TIME;
       break;
 
     case RED:
       // Note that sending red implies a STANDBY response; if not: REMOVE the index
-      nextState = REMOVE_INDEX;
+      // We send red 4 times before giving up on the successor.
+      if (!retries)
+        nextState = REMOVE_INDEX;
+      else
+        retries--;
       color(RED);
       if (!digitalRead(FAST_PIN))
           nextTick = millis() + RED_TIME_FAST;
@@ -406,8 +429,14 @@ void loop() {
 
     case RELEASE_INTERSECTION:
       // We got here because the next node responded with STANDBY
-      nextState = WAIT_TIMEOUT;
-      nextTick = millis() + WAIT_TIMEOUT_TIME + random(2000);
+      if (!retries)
+        nextState = WAIT_TIMEOUT;
+      else
+        retries--;
+
+      // TODO: proper timer
+      nextTick = millis() + 500;
+      // nextTick = millis() + WAIT_TIMEOUT_TIME + random(2000);
       send(RELEASE_INTERSECTION, currentIndex);
       break;
 
